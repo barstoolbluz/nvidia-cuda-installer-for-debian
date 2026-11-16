@@ -67,14 +67,19 @@ run_check_case() {
     }
     modinfo() {
       [[ "$modinfo_works" == yes ]] || return 1
-      [[ "$1" == nvidia ]] || return 1
-      printf 'filename: /lib/modules/mock/nvidia.ko\n'
+      # A healthy CUDA driver fixture must include the required UVM module.
+      case "$1" in
+        nvidia) printf 'filename: /lib/modules/mock/nvidia.ko\n' ;;
+        nvidia-uvm) printf 'filename: /lib/modules/mock/nvidia-uvm.ko\n' ;;
+        *) return 1 ;;
+      esac
     }
     lsmod() {
       if [[ "$modules_loaded" == yes ]]; then
         printf 'nvidia_drm 122880 0\n'
         printf 'nvidia_modeset 1605632 1 nvidia_drm\n'
         printf 'nvidia 99614720 2 nvidia_modeset\n'
+        printf 'nvidia_uvm 123456 1\n'
       else
         printf 'snd 1 0\n'
       fi

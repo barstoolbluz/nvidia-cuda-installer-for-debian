@@ -24,7 +24,6 @@ readonly SCRIPT_NAME="$(basename "$0")"
 readonly TARGET_CODENAME="trixie"
 readonly TARGET_VERSION_ID="13"
 readonly DEFAULT_DRIVER_PACKAGE="cuda-drivers"
-readonly HEADER_PACKAGE="linux-headers-$(uname -r)"
 readonly NVIDIA_REPO_BASE="https://developer.download.nvidia.com/compute/cuda/repos/debian13"
 readonly CUDA_KEYRING_DEB_NAME="cuda-keyring_1.1-1_all.deb"
 readonly CUDA_KEYRING_EXPECTED_PACKAGE="cuda-keyring"
@@ -65,6 +64,7 @@ ASSUME_YES=0
 RESET=0
 REMOVE_ONLY=0
 CHECK_ONLY=0
+REPAIR_KERNEL=0
 SKIP_APT_UPDATE=0
 ALLOW_UNKNOWN_GPU=0
 ALLOW_LEGACY_470=0
@@ -86,6 +86,11 @@ DRY_RUN_WOULD_BOOTSTRAP_NVIDIA_REPO=0
 NVIDIA_REPO_CHANGED=0
 FORCE_BRANCH=0
 DRIVER_BRANCH="auto"
+KERNEL_PROBE_STATE=""
+KERNEL_PROBE_HEADERS=""
+KERNEL_PROBE_DETAIL=""
+RECOVERY_BUILD_FAILED=0
+RECOVERY_LAST_MODPROBE_ERROR=""
 
 GPU_LINES=()
 GPU_FAMILIES=()
@@ -135,12 +140,12 @@ Default behavior:
   - Detect NVIDIA GPU generation with lspci using a device-ID table plus name/chip-prefix heuristics.
   - Pick a driver branch policy.
   - Install a fresh driver only when no existing NVIDIA driver install is detected.
-  - If an existing driver install is detected, make no changes unless --reset is passed.
+  - If an existing driver install is detected, check the running-kernel module and repair it if missing.
   - If only the desired branch-pinning package is present from a prior partial run,
     continue installing the driver.
 
 Important behavior:
-  - Normal install mode is convergent: rerunning after a completed install makes no driver changes.
+  - Normal install mode verifies the running-kernel module and repairs DKMS/header drift.
   - --reset is a repeatable rebuild action, not an idempotent no-op. It purges and reinstalls each time.
   - --remove-only still requires Debian 13/Trixie, but does not require GPU detection or NVIDIA repo access.
   - NVIDIA repo trust is required by default. If the NVIDIA CUDA repo is missing,
@@ -165,6 +170,11 @@ Options:
                             Purge detected NVIDIA driver packages and runfile-driver traces,
                             then exit. This mode does not require GPU detection or NVIDIA repo access,
                             but still requires Debian 13/Trixie.
+
+      --repair-kernel
+                            Rebuild the existing NVIDIA DKMS driver for the running kernel without
+                            purging or changing branches. Requires root except with --dry-run.
+                            Returns 3 when the running kernel cannot be repaired.
 
       --check
                             Run Debian 13/Trixie post-reboot validation checks and exit.
@@ -326,6 +336,7 @@ NVIDIA_CUDA_INSTALLER_STATE_DIR
 NVIDIA_CUDA_INSTALLER_MODPROBE_DIR
 NVIDIA_CUDA_INSTALLER_UDEV_RULES_DIR
 NVIDIA_CUDA_INSTALLER_LOCK_FILE
+NVIDIA_CUDA_INSTALLER_LEGACY_LOCK_FILE
 NVIDIA_CUDA_INSTALLER_VENDOR_580_REPO_DIR
 NVIDIA_CUDA_INSTALLER_VENDOR_580_WORK_DIR
 NVIDIA_CUDA_INSTALLER_VENDOR_580_SOURCE_FILE
@@ -353,43 +364,100 @@ validate_test_path_override_gate() {
   fi
 }
 
-installer_lock_file() {
-  local lock_dir
+installer_is_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]]
+}
 
+installer_lock_file() {
   if [[ -n "$INSTALLER_LOCK_FILE_OVERRIDE" ]]; then
     printf '%s\n' "$INSTALLER_LOCK_FILE_OVERRIDE"
+  else
+    printf '%s\n' /run/nvidia-cuda-installer/lock
+  fi
+}
+
+# In test mode, an omitted override means "no legacy lock": never inspect /run.
+legacy_installer_lock_file() {
+  if [[ "$NVIDIA_CUDA_INSTALLER_TEST_MODE" == "1" ]]; then
+    printf '%s\n' "${NVIDIA_CUDA_INSTALLER_LEGACY_LOCK_FILE:-}"
+  else
+    printf '%s\n' /run/lock/nvidia-cuda-installer.lock
+  fi
+}
+
+retire_legacy_execution_lock() {
+  local old_file owner owner_name
+  old_file="$(legacy_installer_lock_file)"
+  [[ -n "$old_file" ]] || return 0
+  [[ -e "$old_file" || -L "$old_file" ]] || return 0
+
+  if [[ -L "$old_file" || ! -f "$old_file" ]]; then
+    warn "Leaving unexpected legacy lock path untouched: $old_file"
+    return 0
+  fi
+  owner="$(stat -c '%u' -- "$old_file" 2>/dev/null || true)"
+  owner_name="$(stat -c '%U' -- "$old_file" 2>/dev/null || printf 'unknown')"
+  if [[ "$owner" != "0" ]]; then
+    warn "Leaving foreign-owned legacy lock $old_file (owner: $owner_name, uid: ${owner:-unknown}) untouched. A sticky-directory lock may fail with fs.protected_regular=2; this installer now uses /run/nvidia-cuda-installer/lock."
     return 0
   fi
 
-  if [[ -d /run/lock && -w /run/lock ]]; then
-    lock_dir=/run/lock
-  else
-    lock_dir=/tmp
+  # Do not unlink a lock still held by an older installer invocation.
+  if ! { exec 8<>"$old_file"; } 2>/dev/null; then
+    warn "Could not open legacy root-owned lock $old_file; leaving it untouched."
+    return 0
   fi
-
-  printf '%s/nvidia-cuda-installer.lock\n' "$lock_dir"
+  if ! flock -n 8; then
+    exec 8>&-
+    die "An earlier installer invocation holds legacy lock: $old_file"
+  fi
+  rm -- "$old_file" || warn "Could not retire legacy lock $old_file; continuing with the new lock."
+  exec 8>&-
 }
 
 acquire_execution_lock() {
-  local lock_file lock_dir
+  local lock_file lock_dir owner mode required_owner=0
 
-  command_exists flock || die "flock is required for the global installer execution lock; install util-linux before running this installer."
-
-  lock_file="$(installer_lock_file)"
-  lock_dir="$(dirname "$lock_file")"
-
-  if [[ ! -d "$lock_dir" ]]; then
-    if (( DRY_RUN )); then
-      log "Dry run: would create lock directory: $lock_dir"
-    else
-      install -d -m 0755 "$lock_dir"
-    fi
+  # These are read-only operations, including root-initiated checks and simulations.
+  if (( CHECK_ONLY || DRY_RUN )); then
+    log "Read-only check/dry-run: running without an execution lock; no lock file will be written."
+    return 0
+  fi
+  if ! installer_is_root && [[ -z "$INSTALLER_LOCK_FILE_OVERRIDE" ]]; then
+    log "Non-root read-only invocation: running unlocked; /run/nvidia-cuda-installer is root-owned."
+    return 0
+  fi
+  # Tests retain their pre-v8 lock concurrency checks when run without root;
+  # the override is accepted only under the existing test-mode gate.
+  if [[ -n "$INSTALLER_LOCK_FILE_OVERRIDE" && "$NVIDIA_CUDA_INSTALLER_TEST_MODE" == "1" ]]; then
+    required_owner="$(id -u)"
   fi
 
-  exec 9>"$lock_file" || die "Could not open installer lock file: $lock_file"
+  command_exists flock || die "flock is required for the global installer execution lock; install util-linux before running this installer."
+  lock_file="$(installer_lock_file)"
+  lock_dir="$(dirname "$lock_file")"
+  [[ ! -L "$lock_dir" ]] || die "Refusing symlinked installer lock directory: $lock_dir"
+  if [[ ! -d "$lock_dir" ]]; then
+    install -d -m 0755 -- "$lock_dir" || die "Cannot create installer lock directory: $lock_dir"
+  fi
+  if [[ "$(stat -c '%u' -- "$lock_dir" 2>/dev/null || true)" != "$required_owner" ]]; then
+    die "Refusing installer lock directory without expected uid $required_owner ownership: $lock_dir"
+  fi
+  mode="$(stat -c '%a' -- "$lock_dir" 2>/dev/null || true)"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "Cannot inspect installer lock directory mode: $lock_dir"
+  if (( (8#$mode & 0022) != 0 || (8#$mode & 01000) != 0 )); then
+    die "Refusing group/world-writable or sticky installer lock directory: $lock_dir (mode $mode)"
+  fi
+  [[ ! -L "$lock_file" ]] || die "Refusing symlinked installer lock file: $lock_file"
+
+  if ! { exec 9>"$lock_file"; } 2>/dev/null; then
+    owner="$(stat -c '%U (uid %u)' -- "$lock_file" 2>/dev/null || printf 'unknown')"
+    die "Could not open installer lock $lock_file (owner: $owner). Sticky world-writable lock directories can trigger fs.protected_regular=2; use a root-owned, non-sticky directory."
+  fi
   if ! flock -n 9; then
     die "Another NVIDIA CUDA installer invocation is already running. Lock is held on: $lock_file"
   fi
+  retire_legacy_execution_lock
   log "Acquired installer execution lock: $lock_file"
 }
 
@@ -445,6 +513,9 @@ parse_args() {
         ;;
       --reset)
         RESET=1
+        ;;
+      --repair-kernel)
+        REPAIR_KERNEL=1
         ;;
       --remove-only)
         REMOVE_ONLY=1
@@ -551,7 +622,7 @@ parse_args() {
     *) die "--laptop-power must be one of: auto, ask, on, off." ;;
   esac
 
-  if (( CHECK_LAPTOP_POWER_IDLE )) && (( RESET || REMOVE_ONLY )); then
+  if (( CHECK_LAPTOP_POWER_IDLE )) && (( RESET || REMOVE_ONLY || REPAIR_KERNEL )); then
     die "--check-laptop-power-idle is read-only and cannot be combined with --reset or --remove-only."
   fi
 
@@ -559,12 +630,16 @@ parse_args() {
     die "Use either --reset or --remove-only, not both."
   fi
 
-  if (( CHECK_ONLY )) && (( RESET || REMOVE_ONLY )); then
+  if (( CHECK_ONLY )) && (( RESET || REMOVE_ONLY || REPAIR_KERNEL )); then
     die "Use --check by itself; it does not install, reset, or purge."
   fi
 
   if [[ "$DRIVER_BRANCH" == "470" && "$ALLOW_LEGACY_470" -ne 1 ]]; then
     die "Branch 470 requires --allow-legacy-470."
+  fi
+
+  if (( REPAIR_KERNEL && (RESET || REMOVE_ONLY || YOLO) )); then
+    die "--repair-kernel cannot be combined with --reset or --remove-only."
   fi
 
   if (( FORCE_BRANCH )) && [[ "$DRIVER_BRANCH" == "auto" ]]; then
@@ -2721,10 +2796,31 @@ check_pinning_conflicts() {
   fi
 }
 
+kernel_running_version() {
+  uname -r
+}
+
+kernel_header_package() {
+  printf 'linux-headers-%s\n' "$(kernel_running_version)"
+}
+
+kernel_headers_meta_package() {
+  local arch
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64|arm64) printf 'linux-headers-%s\n' "$arch" ;;
+    *) die "No supported Debian kernel-headers metapackage for architecture: $arch" ;;
+  esac
+}
+
 install_headers() {
-  require_candidate "$HEADER_PACKAGE"
-  log "Installing kernel headers for $(uname -r)..."
-  run_apt_get install "$HEADER_PACKAGE"
+  local header meta
+  header="$(kernel_header_package)"
+  meta="$(kernel_headers_meta_package)"
+  require_candidate "$header"
+  require_candidate "$meta"
+  log "Installing kernel headers for $(kernel_running_version) and future kernel upgrades..."
+  run_apt_get install "$header" "$meta"
 }
 
 install_driver_branch_pinning() {
@@ -2769,7 +2865,7 @@ install_driver() {
 preflight_install_plan() {
   local branch="$1"
   local pinning_package
-  local -a packages=("$HEADER_PACKAGE")
+  local -a packages=("$(kernel_header_package)" "$(kernel_headers_meta_package)")
 
   if (( DRY_RUN && DEBIAN12_580_FALLBACK_ACTIVE )) && [[ "$branch" == "580" ]]; then
     log "Dry run: would simulate target install transaction after creating the local branch-580 vendor repo."
@@ -4743,6 +4839,708 @@ dkms_has_nvidia_entries() {
   grep -qi nvidia <<< "$status"
 }
 
+# Return a normalized version|kernel|state record for each NVIDIA DKMS entry.
+# DKMS also emits "nvidia/version: added" before any kernel has been built.
+dkms_nvidia_records() {
+  local line rest version kernel state
+  while IFS= read -r line; do
+    [[ "$line" == nvidia/* ]] || continue
+    rest="${line#nvidia/}"
+    version="${rest%%,*}"
+    version="${version%%:*}"
+    # Version is used in DKMS command arguments and in a diagnostic path.
+    [[ "$version" =~ ^[[:alnum:].+~_-]+$ ]] || continue
+    kernel=""
+    if [[ "$rest" == *,* ]]; then
+      kernel="${rest#*,}"
+      kernel="${kernel%%,*}"
+      kernel="${kernel#"${kernel%%[![:space:]]*}"}"
+      kernel="${kernel%"${kernel##*[![:space:]]}"}"
+    fi
+    state="${rest##*:}"
+    state="${state#"${state%%[![:space:]]*}"}"
+    printf '%s|%s|%s\n' "$version" "$kernel" "$state"
+  done < <(dkms_status_output)
+}
+
+dkms_nvidia_unique_version() {
+  local -a versions=()
+  mapfile -t versions < <(dkms_nvidia_records | cut -d '|' -f 1 | sort -u)
+  if ((${#versions[@]} != 1)); then
+    warn "Expected one NVIDIA DKMS source version; found ${#versions[@]}. Refusing to choose a driver version to rebuild."
+    return 1
+  fi
+  printf '%s\n' "${versions[0]}"
+}
+
+dkms_nvidia_running_installed() {
+  local version="$1" kernel="$2" v k state
+  while IFS='|' read -r v k state; do
+    if [[ "$v" == "$version" && "$k" == "$kernel" && "$state" == installed* ]]; then
+      return 0
+    fi
+  done < <(dkms_nvidia_records)
+  return 1
+}
+
+kernel_modinfo_running() {
+  command_exists modinfo && modinfo nvidia >/dev/null 2>&1
+}
+
+# CUDA requires the UVM module even when the base driver and nvidia-smi work.
+# Like the base-module lookup, this targets the currently running kernel.
+kernel_cuda_uvm_available() {
+  command_exists modinfo && modinfo nvidia-uvm >/dev/null 2>&1
+}
+
+# Module-file discovery is insufficient: read-only validation can certify UVM
+# only if the kernel has already loaded it. lsmod names it nvidia_uvm.
+kernel_cuda_uvm_loaded() {
+  command_exists lsmod || return 1
+  lsmod 2>/dev/null | awk '$1 == "nvidia_uvm" { found=1 } END { exit found ? 0 : 1 }'
+}
+
+kernel_nvidia_module_loaded() {
+  command_exists lsmod || return 1
+  lsmod 2>/dev/null | awk '$1 == "nvidia" { found=1 } END { exit found ? 0 : 1 }'
+}
+
+kernel_modprobe_dry_run() {
+  local output
+  RECOVERY_LAST_MODPROBE_ERROR=""
+  command_exists modprobe || return 1
+  if output="$(modprobe --dry-run nvidia 2>&1)"; then
+    return 0
+  fi
+  RECOVERY_LAST_MODPROBE_ERROR="$output"
+  return 1
+}
+
+kernel_secure_boot_enabled() {
+  command_exists mokutil && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
+}
+
+# These are read-only observations. A successful `modprobe --dry-run` only
+# establishes that kmod can resolve a module; it never checks kernel signature
+# enforcement or whether insertion would succeed.
+kernel_nvidia_loaded_version() {
+  local version=""
+  [[ -r /sys/module/nvidia/version ]] || return 1
+  IFS= read -r version < /sys/module/nvidia/version || [[ -n "$version" ]] || return 1
+  printf '%s\n' "$version"
+}
+
+kernel_nvidia_module_file_version() {
+  command_exists modinfo || return 1
+  modinfo -F version nvidia 2>/dev/null
+}
+
+kernel_nvidia_userspace_mismatch() {
+  local output
+  command_exists nvidia-smi || return 1
+  output="$(nvidia-smi 2>&1 || true)"
+  grep -qi 'Driver/library version mismatch' <<< "$output"
+}
+
+# Exactly one primary state. Missing headers is a detail of the missing-module
+# state so a check still gives the same repair instruction as the install path.
+probe_nvidia_kernel_state() {
+  KERNEL_PROBE_STATE=""
+  KERNEL_PROBE_HEADERS=present
+  KERNEL_PROBE_DETAIL=""
+  local header
+  header="$(kernel_header_package)"
+  if ! package_installed "$header"; then
+    KERNEL_PROBE_HEADERS=headers-missing
+  fi
+
+  if (( RECOVERY_BUILD_FAILED )); then
+    KERNEL_PROBE_STATE="build-failed"
+    return 0
+  fi
+  if kernel_modinfo_running; then
+    local loaded=0 loaded_version disk_version
+    if kernel_nvidia_module_loaded; then
+      loaded=1
+      loaded_version="$(kernel_nvidia_loaded_version || true)"
+      disk_version="$(kernel_nvidia_module_file_version || true)"
+      if [[ -n "$loaded_version" && -n "$disk_version" && "$loaded_version" != "$disk_version" ]]; then
+        KERNEL_PROBE_STATE="module-present-not-loadable"
+        KERNEL_PROBE_DETAIL="The loaded NVIDIA module version $loaded_version differs from the installed module version $disk_version. Reboot into the current kernel to load the installed driver."
+        return 0
+      fi
+      if kernel_nvidia_userspace_mismatch; then
+        KERNEL_PROBE_STATE="module-present-not-loadable"
+        KERNEL_PROBE_DETAIL="NVIDIA userspace reports a driver/library version mismatch; reboot may be required."
+        return 0
+      fi
+    fi
+    if ! kernel_cuda_uvm_available; then
+      KERNEL_PROBE_STATE="module-missing-for-running-kernel"
+      KERNEL_PROBE_DETAIL="Required CUDA module nvidia-uvm is missing for $(kernel_running_version)."
+    elif (( loaded )) && ! kernel_cuda_uvm_loaded; then
+      # An on-disk UVM module can still be rejected by Secure Boot or fail
+      # insertion for other reasons. Only the recovery mutator may load it.
+      KERNEL_PROBE_STATE="module-present-load-unverified"
+      KERNEL_PROBE_DETAIL="Required CUDA module nvidia-uvm exists but is not loaded; a read-only check cannot verify insertion."
+    elif (( loaded )); then
+      KERNEL_PROBE_STATE=healthy
+    elif kernel_modprobe_dry_run; then
+      # A check cannot insert the module: it must not claim that loadability
+      # or Secure Boot signature verification has succeeded.
+      KERNEL_PROBE_STATE="module-present-load-unverified"
+      KERNEL_PROBE_DETAIL="The module is available but has not been loaded; modprobe --dry-run cannot verify insertion."
+    else
+      KERNEL_PROBE_STATE="module-present-not-loadable"
+      KERNEL_PROBE_DETAIL="$RECOVERY_LAST_MODPROBE_ERROR"
+    fi
+    return 0
+  fi
+  if has_installed_driver_packages || nonpackaged_nvidia_runtime_present || dkms_has_nvidia_entries; then
+    KERNEL_PROBE_STATE="module-missing-for-running-kernel"
+    return 0
+  fi
+  KERNEL_PROBE_STATE="no-driver"
+}
+
+# Recovery mutators are called through this one entry point. No command in the
+# recovery flow can be executed by a dry-run, including "harmless" apt simulations.
+recovery_run() {
+  if (( DRY_RUN )); then
+    log "Dry run: would run $(printf '%q ' "$@")"
+    return 0
+  fi
+  log "Running: $(printf '%q ' "$@")"
+  "$@"
+}
+
+recovery_apt_install() {
+  if (( DRY_RUN )); then
+    log "Dry run: would apt-get install $(printf '%q ' "$@")"
+    return 0
+  fi
+  run_apt_get install "$@"
+}
+
+recovery_install_headers() {
+  local header meta package
+  local -a missing=()
+  header="$(kernel_header_package)"
+  meta="$(kernel_headers_meta_package)"
+  for package in "$header" "$meta"; do
+    if package_installed "$package"; then
+      log "Kernel header package already installed: $package"
+    else
+      if ! package_candidate_exists "$package"; then
+        warn "No APT candidate for $package; this running kernel may come from an unconfigured or retired repository."
+        return 1
+      fi
+      missing+=("$package")
+    fi
+  done
+  if ((${#missing[@]})); then
+    log "Installing missing kernel headers (including the tracking metapackage)..."
+    if ! recovery_apt_install "${missing[@]}"; then
+      warn "APT header installation failed. The DKMS header post-install hook may have failed; inspect the APT output and dpkg --audit before another package transaction."
+      return 1
+    fi
+  fi
+}
+
+recovery_dkms_make_log_path() {
+  printf '/var/lib/dkms/nvidia/%s/build/make.log\n' "$1"
+}
+
+recovery_show_dkms_failure() {
+  local version="$1" make_log
+  RECOVERY_BUILD_FAILED=1
+  probe_nvidia_kernel_state
+  warn "Kernel recovery state: $KERNEL_PROBE_STATE; NVIDIA DKMS failed for $(kernel_running_version)."
+  make_log="$(recovery_dkms_make_log_path "$version")"
+  if [[ -r "$make_log" ]]; then
+    warn "Last 40 lines of DKMS build log ($make_log):"
+    tail -n 40 -- "$make_log" >&2
+  else
+    warn "DKMS build log unavailable: $make_log"
+  fi
+}
+
+# Older installed driver releases such as 535 can still serve a Pascal GPU.
+# Classify hardware as well as the version before selecting a recovery family.
+recovery_gpu_requires_legacy() {
+  local line family classification
+  command_exists lspci || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    classification="$(classify_gpu_line "$line")"
+    family="${classification%%|*}"
+    case "$family" in
+      kepler|maxwell|pascal|volta) return 0 ;;
+    esac
+  done < <(nvidia_pci_lines)
+  return 1
+}
+
+# Recovery may never upgrade a driver to the current family without affirmative
+# hardware compatibility evidence. --force-branch is deliberately not a waiver
+# for an incidental upgrade during a kernel repair.
+recovery_current_branch_compatible() {
+  local -a lines=()
+  if ! command_exists lspci; then
+    warn "Cannot verify GPU compatibility because lspci is unavailable; declining a current-branch recovery upgrade."
+    return 1
+  fi
+  mapfile -t lines < <(nvidia_pci_lines)
+  if ((${#lines[@]} == 0)); then
+    warn "Cannot verify GPU compatibility because no NVIDIA GPU was enumerated; declining a current-branch recovery upgrade."
+    return 1
+  fi
+  load_gpu_inventory_from_lines "${lines[@]}"
+  if ! all_families_in turing ampere ada hopper blackwell; then
+    warn "Current-branch recovery upgrade is incompatible with or unverified for the detected GPU families: ${GPU_FAMILIES[*]}. Preserving the installed driver."
+    return 1
+  fi
+  return 0
+}
+
+recovery_driver_family() {
+  local version="$1" pins
+  pins="$(installed_pinning_packages)"
+  if grep -Eq '^nvidia-driver-pinning-(470|580)([.[:space:]-]|$)' <<< "$pins"; then
+    printf 'legacy\n'
+  elif [[ "$version" == 470.* ]] || recovery_gpu_requires_legacy; then
+    printf 'legacy\n'
+  elif [[ "$version" == 580.* ]] && ! recovery_current_branch_compatible >/dev/null 2>&1; then
+    # R580 supports both legacy GPUs and newer GPUs. Without a branch pin,
+    # only affirmative current-family GPU compatibility permits an upgrade.
+    printf 'legacy\n'
+  else
+    printf 'modern\n'
+  fi
+}
+
+kernel_initramfs_modules_file() {
+  printf '%s\n' /etc/initramfs-tools/modules
+}
+
+kernel_initramfs_includes_nvidia_drm() {
+  local config
+  config="$(kernel_initramfs_modules_file)"
+  [[ -r "$config" ]] || return 1
+  grep -Eq '^[[:space:]]*nvidia[-_]drm([[:space:]]|$)' "$config"
+}
+
+recovery_restart_persistenced_if_failed() {
+  if command_exists systemctl && systemctl is-enabled --quiet nvidia-persistenced.service >/dev/null 2>&1 \
+    && systemctl is-failed --quiet nvidia-persistenced.service >/dev/null 2>&1; then
+    recovery_run systemctl restart nvidia-persistenced.service
+  fi
+}
+
+recovery_update_initramfs_if_needed() {
+  if kernel_initramfs_includes_nvidia_drm; then
+    recovery_run update-initramfs -u -k "$(kernel_running_version)"
+  else
+    log "nvidia-drm is not listed in the initramfs modules configuration; skipping initramfs regeneration."
+  fi
+}
+
+# Kernel lockdown can report EPERM to kmod without mentioning a key. Only
+# classify that error as Secure Boot rejection if recent kernel diagnostics
+# independently report an unsigned-module lockdown for modprobe/NVIDIA.
+kernel_nvidia_unsigned_lockdown_evidence() {
+  local kernel_log
+  command_exists dmesg || return 1
+  kernel_log="$(dmesg --color=never 2>/dev/null | tail -n 80)" || return 1
+  grep -Eiq 'Lockdown:[[:space:]]*(modprobe|nvidia):.*(unsigned[[:space:]]+module|module.*signature)' <<< "$kernel_log"
+}
+
+recovery_diagnose_module_load() {
+  local error="$1" smi_err=""
+  if [[ -n "$error" ]]; then
+    warn "NVIDIA module diagnostic: $error"
+  fi
+  if kernel_secure_boot_enabled && {
+    grep -Eiq 'signature|key.*rejected|required key|key.*not available|verification failed' <<< "$error" \
+      || { grep -qi 'Operation not permitted' <<< "$error" && kernel_nvidia_unsigned_lockdown_evidence; }
+  }; then
+    warn "Secure Boot rejected the NVIDIA module signature. Sign the DKMS module using its MOK (Debian 13 commonly stores this at /var/lib/dkms/mok.key), then enroll that key in MokManager after a reboot. This installer does not enroll keys."
+    return 0
+  fi
+  if command_exists lsmod && lsmod 2>/dev/null | awk '$1 == "nouveau" { found=1 } END { exit found ? 0 : 1 }'; then
+    warn "nouveau is loaded and may prevent NVIDIA from claiming the GPU. Review the existing administrator module policy before changing it."
+  fi
+  if command_exists nvidia-smi; then
+    smi_err="$(nvidia-smi 2>&1 || true)"
+    if grep -qi 'Driver/library version mismatch' <<< "$smi_err"; then
+      warn "NVIDIA userspace and the loaded kernel module have a driver/library version mismatch; a reboot may be required."
+    fi
+  fi
+}
+
+recovery_load_modules() {
+  local module error=""
+  if ! error="$(recovery_run modprobe nvidia 2>&1)"; then
+    recovery_diagnose_module_load "$error"
+    return 1
+  fi
+  [[ -z "$error" ]] || printf '%s\n' "$error"
+  for module in nvidia-uvm nvidia-modeset nvidia-drm; do
+    if ! command_exists modinfo || ! modinfo "$module" >/dev/null 2>&1; then
+      if [[ "$module" == nvidia-uvm ]]; then
+        warn "Required NVIDIA CUDA module nvidia-uvm is missing for $(kernel_running_version)."
+        return 1
+      fi
+      continue
+    fi
+    if ! error="$(recovery_run modprobe "$module" 2>&1)"; then
+      # UVM is required for CUDA. DRM/KMS is optional on a headless host,
+      # unless the administrator explicitly requires DRM in the initramfs.
+      if [[ "$module" == nvidia-uvm ]] \
+        || { [[ "$module" == nvidia-drm ]] && kernel_initramfs_includes_nvidia_drm; }; then
+        warn "Required NVIDIA module $module could not be loaded."
+        recovery_diagnose_module_load "$error"
+        return 1
+      fi
+      warn "Optional NVIDIA module $module could not be loaded."
+      recovery_diagnose_module_load "$error"
+      continue
+    fi
+    [[ -z "$error" ]] || printf '%s\n' "$error"
+  done
+  return 0
+}
+
+installed_linux_image_packages() {
+  dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'linux-image-*' 2>/dev/null \
+    | awk '$1 == "ii" && $2 ~ /^linux-image-/ { print $2 }' || true
+}
+
+recovery_kernel_boot_artifacts_present() {
+  local kernel="$1"
+  [[ -s "/boot/vmlinuz-$kernel" && -s "/boot/initrd.img-$kernel" ]]
+}
+
+recovery_fallback_module_present() {
+  local kernel="$1" version="$2" on_disk module
+  command_exists modinfo || return 1
+  for module in nvidia nvidia-uvm; do
+    on_disk="$(modinfo -k "$kernel" -F version "$module" 2>/dev/null)" || return 1
+    [[ "$on_disk" == "$version" ]] || return 1
+  done
+  return 0
+}
+
+recovery_bootable_kernels() {
+  local version="$1" running v kernel status pkg
+  local -A installed=()
+  running="$(kernel_running_version)"
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    installed["$pkg"]=1
+  done < <(installed_linux_image_packages)
+  while IFS='|' read -r v kernel status; do
+    if [[ "$v" == "$version" && "$status" == installed* && -n "$kernel" \
+      && "$kernel" != "$running" && -n "${installed[linux-image-$kernel]:-}" ]]; then
+      if ! recovery_kernel_boot_artifacts_present "$kernel"; then
+        warn "Skipping fallback kernel $kernel: kernel image or initramfs is missing."
+      elif ! recovery_fallback_module_present "$kernel" "$version"; then
+        warn "Skipping fallback kernel $kernel: required NVIDIA or CUDA UVM module is unavailable or does not match DKMS version $version."
+      else
+        printf '%s\n' "$kernel"
+      fi
+    fi
+  done < <(dkms_nvidia_records) | sort -Vu
+}
+
+recovery_grub_config_file() {
+  printf '%s\n' /boot/grub/grub.cfg
+}
+
+# Only emit a GRUB title when it is present in the generated configuration;
+# do not synthesize distro-dependent labels or assume GRUB is the bootloader.
+recovery_grub_entry_for_kernel() {
+  local kernel="$1" config line submenu="" title
+  config="$(recovery_grub_config_file)"
+  [[ -r "$config" ]] || return 1
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*submenu[[:space:]]+\'([^\']+)\' ]]; then
+      submenu="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*menuentry[[:space:]]+\'([^\']+)\' ]]; then
+      title="${BASH_REMATCH[1]}"
+      if [[ "$title" == *"with Linux $kernel" && "$title" != *'recovery mode'* ]]; then
+        if [[ -n "$submenu" ]]; then
+          printf '%s>%s\n' "$submenu" "$title"
+        else
+          printf '%s\n' "$title"
+        fi
+        return 0
+      fi
+    fi
+  done < "$config"
+  return 1
+}
+
+recovery_boot_fallback() {
+  local version="$1" kernel chosen="" entry
+  local -a kernels=()
+  mapfile -t kernels < <(recovery_bootable_kernels "$version")
+  warn "The running kernel $(kernel_running_version) could not be repaired; installed driver packages were preserved."
+  if ((${#kernels[@]} == 0)); then
+    warn "No other installed linux-image package has verified boot artifacts and matching NVIDIA/CUDA UVM module files for nvidia/$version. No boot fallback can be recommended."
+    return 3
+  fi
+  printf 'Installed kernels with nvidia/%s DKMS modules and verified boot artifacts:\n' "$version"
+  for kernel in "${kernels[@]}"; do
+    printf '  - %s\n' "$kernel"
+    if entry="$(recovery_grub_entry_for_kernel "$kernel")"; then
+      printf '    Exact GRUB menu entry: %s\n' "$entry"
+      printf '    One-shot command: sudo grub-reboot %q\n' "$entry"
+      chosen="$kernel"
+    else
+      printf '    GRUB entry not found in the generated configuration; select this kernel manually if available.\n'
+    fi
+  done
+  printf 'To pause kernel upgrades: sudo apt-mark hold linux-image-%s\n' "$(dpkg --print-architecture)"
+  if [[ -z "$chosen" ]]; then
+    warn "No verified GRUB menu entry; no boot-selection command will be issued."
+    return 3
+  fi
+  entry="$(recovery_grub_entry_for_kernel "$chosen")"
+  if ! command_exists grub-reboot; then
+    warn "grub-reboot is unavailable; select an older kernel manually from your bootloader."
+    return 3
+  fi
+  if confirm "Schedule a one-shot boot into $chosen"; then
+    recovery_run grub-reboot "$entry" || warn "Could not schedule a one-shot GRUB boot."
+  fi
+  if command_exists apt-mark && confirm "Hold linux-image-$(dpkg --print-architecture) to avoid further kernel upgrades until the driver is repaired"; then
+    recovery_run apt-mark hold "linux-image-$(dpkg --print-architecture)" || warn "Could not hold the kernel metapackage."
+  fi
+  warn "The verified fallback candidate has an NVIDIA module file, but cannot be proven loadable until it boots. Kernel changes have not been applied now."
+  return 3
+}
+
+recovery_rebuild_dkms() {
+  local version="$1" kernel="$2"
+  if dkms_nvidia_running_installed "$version" "$kernel" \
+    && kernel_modinfo_running && kernel_cuda_uvm_available; then
+    log "NVIDIA DKMS and required CUDA modules are already installed for $kernel."
+    return 0
+  fi
+  log "Building the existing nvidia/$version DKMS source for $kernel..."
+  local autoinstall_status=0
+  recovery_run dkms autoinstall -k "$kernel" || autoinstall_status=$?
+  # DKMS autoinstall builds all registered modules. Its exit status can reflect
+  # an unrelated driver even when NVIDIA installed successfully. Check NVIDIA
+  # independently, and use a targeted install if it has not converged.
+  if (( autoinstall_status != 0 )); then
+    warn "DKMS autoinstall exited $autoinstall_status; checking nvidia/$version status before concluding NVIDIA failed."
+  fi
+  if ! dkms_nvidia_running_installed "$version" "$kernel"; then
+    log "DKMS autoinstall did not install nvidia/$version for $kernel; trying explicit dkms install."
+    if ! recovery_run dkms install "nvidia/$version" -k "$kernel"; then
+      return 1
+    fi
+  fi
+  if ! dkms_nvidia_running_installed "$version" "$kernel"; then
+    warn "DKMS returned success but nvidia/$version is still not installed for $kernel."
+    return 1
+  fi
+  if ! kernel_modinfo_running || ! kernel_cuda_uvm_available; then
+    warn "DKMS reports nvidia/$version installed but the base or required CUDA UVM module is missing; forcing a DKMS install for $kernel."
+    if ! recovery_run dkms install "nvidia/$version" -k "$kernel" --force; then
+      return 1
+    fi
+    if ! kernel_modinfo_running || ! kernel_cuda_uvm_available; then
+      warn "DKMS install completed but modinfo still cannot find the running-kernel NVIDIA and CUDA UVM modules."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+recovery_finish_success() {
+  RECOVERY_BUILD_FAILED=0
+  if ! recovery_load_modules; then
+    return 3
+  fi
+  probe_nvidia_kernel_state
+  if [[ "$KERNEL_PROBE_STATE" != healthy ]]; then
+    warn "Kernel module did not converge after loading: $KERNEL_PROBE_STATE"
+    recovery_diagnose_module_load "$KERNEL_PROBE_DETAIL"
+    return 3
+  fi
+  recovery_restart_persistenced_if_failed || warn "nvidia-persistenced restart failed; inspect systemctl status."
+  if ! recovery_update_initramfs_if_needed; then
+    warn "Required initramfs regeneration failed. The live module may work, but boot-time module configuration is not confirmed."
+    return 3
+  fi
+  if package_installed "$(kernel_headers_meta_package)"; then
+    log "The kernel headers metapackage is installed; the DKMS header hook can rebuild on future APT kernel upgrades."
+  else
+    warn "The kernel headers metapackage is absent; future kernel upgrades may break the driver again."
+  fi
+  if package_installed unattended-upgrades; then
+    log "unattended-upgrades is installed; its kernel upgrades will also trigger the DKMS header hook while headers remain available."
+  fi
+  log "Kernel recovery complete: healthy for $(kernel_running_version). No reboot normally needed after a successful in-place DKMS rebuild."
+  return 0
+}
+
+recovery_modern_build_failure() {
+  local kernel="$1" version
+  warn "A newer current-branch driver may support this kernel."
+  recovery_current_branch_compatible || return 1
+  if ! confirm "Upgrade existing cuda-drivers from configured NVIDIA repositories, then repair its DKMS source if necessary"; then
+    warn "Modern-driver upgrade declined; preserving installed driver packages."
+    return 1
+  fi
+  # Reinstalling the old DKMS package first can run its failing postinst and
+  # leave dpkg unconfigured before APT gets a chance to upgrade the driver.
+  if ! recovery_apt_install --only-upgrade cuda-drivers; then
+    warn "Modern-driver upgrade failed; inspect APT/dpkg state before another package transaction."
+    return 1
+  fi
+  if ! version="$(dkms_nvidia_unique_version)"; then
+    return 1
+  fi
+  RECOVERY_BUILD_FAILED=0
+  if recovery_rebuild_dkms "$version" "$kernel"; then
+    # A module-load failure is not a DKMS build failure; don't reinstall again.
+    recovery_finish_success && return 0
+    return 1
+  fi
+  # An upgrade may have been a no-op or may have left the new DKMS source
+  # incomplete. Reinstall only after the compatible upgrade had its chance.
+  warn "The upgraded driver has not built for this kernel; trying one DKMS source reinstall."
+  if ! recovery_apt_install --reinstall nvidia-kernel-dkms; then
+    warn "NVIDIA DKMS source reinstall failed; inspect APT/dpkg state."
+    return 1
+  fi
+  if ! version="$(dkms_nvidia_unique_version)"; then
+    return 1
+  fi
+  RECOVERY_BUILD_FAILED=0
+  if recovery_rebuild_dkms "$version" "$kernel"; then
+    recovery_finish_success && return 0
+    return 1
+  fi
+  recovery_show_dkms_failure "$version"
+  return 1
+}
+
+recovery_plan_dry_run() {
+  local version="$1" kernel="$2"
+  log "Dry run: kernel module state: $KERNEL_PROBE_STATE ($KERNEL_PROBE_HEADERS). No changes will be made."
+  if ! recovery_install_headers; then
+    warn "Dry run: missing header candidate; would report bootable older kernels instead of building."
+    return 3
+  fi
+  if [[ "$KERNEL_PROBE_STATE" != module-present-not-loadable && "$KERNEL_PROBE_STATE" != module-present-load-unverified ]]; then
+    recovery_run dkms autoinstall -k "$kernel"
+    log "Dry run: if DKMS autoinstall leaves the module added/built, would run dkms install nvidia/$version -k $kernel."
+    if ! kernel_modinfo_running || ! kernel_cuda_uvm_available; then
+      log "Dry run: if DKMS still reports nvidia/$version installed but the base or CUDA UVM module remains missing after autoinstall, would run dkms install nvidia/$version -k $kernel --force."
+    fi
+  fi
+  recovery_run modprobe nvidia
+  local module
+  for module in nvidia-uvm nvidia-modeset nvidia-drm; do
+    if [[ "$module" == nvidia-uvm ]] \
+      || { command_exists modinfo && modinfo "$module" >/dev/null 2>&1; }; then
+      recovery_run modprobe "$module"
+    fi
+  done
+  recovery_restart_persistenced_if_failed
+  recovery_update_initramfs_if_needed
+  log "Dry run: would re-probe the running kernel and report whether a reboot is necessary."
+  return 0
+}
+
+recover_nvidia_kernel() {
+  local state kernel version family
+  kernel="$(kernel_running_version)"
+  probe_nvidia_kernel_state
+  state="$KERNEL_PROBE_STATE"
+  log "Kernel recovery convergence state: $state ($KERNEL_PROBE_HEADERS) for $kernel."
+  if [[ "$state" == no-driver ]]; then
+    warn "No installed NVIDIA driver was found to repair. Use the normal install mode."
+    return 1
+  fi
+  if [[ "$state" == healthy ]]; then
+    if package_installed "$(kernel_headers_meta_package)"; then
+      log "Running-kernel driver is already healthy; no driver changes required."
+      return 0
+    fi
+    log "Running-kernel driver is healthy; installing the missing kernel header tracking metapackage."
+    if ! recovery_install_headers; then
+      warn "Unable to install the tracking headers; the driver is healthy now but may break at the next kernel upgrade."
+      return 3
+    fi
+    probe_nvidia_kernel_state
+    if [[ "$KERNEL_PROBE_STATE" != healthy ]]; then
+      warn "Driver was no longer healthy after installing the header tracking packages."
+      return 3
+    fi
+    return 0
+  fi
+  # A loaded module from the previous package version cannot be replaced by
+  # modprobe, and scheduling an older-kernel fallback would be misleading.
+  # Leave the current boot selection untouched and explain the needed reboot.
+  if [[ "$state" == module-present-not-loadable ]] && kernel_nvidia_module_loaded; then
+    recovery_diagnose_module_load "$KERNEL_PROBE_DETAIL"
+    warn "The running NVIDIA module is stale relative to its installed files or userspace. Reboot into the current kernel and verify again; no boot fallback was scheduled."
+    return 3
+  fi
+  if ! version="$(dkms_nvidia_unique_version)"; then
+    warn "No unambiguous nvidia/<version> DKMS source can be selected for this installed driver."
+    return 3
+  fi
+  family="$(recovery_driver_family "$version")"
+  log "Recovery family: $family (nvidia/$version). Existing driver branch will be preserved."
+  if [[ "$state" == module-present-not-loadable ]]; then
+    recovery_diagnose_module_load "$KERNEL_PROBE_DETAIL"
+  fi
+  if (( DRY_RUN )); then
+    recovery_plan_dry_run "$version" "$kernel"
+    return $?
+  fi
+  if ! recovery_install_headers; then
+    local make_log
+    make_log="$(recovery_dkms_make_log_path "$version")"
+    if [[ -r "$make_log" ]]; then
+      warn "DKMS build log, if the APT header hook attempted a build ($make_log):"
+      tail -n 40 -- "$make_log" >&2
+    fi
+    recovery_boot_fallback "$version"
+    return 3
+  fi
+  if [[ "$state" == module-present-not-loadable || "$state" == module-present-load-unverified ]]; then
+    if recovery_finish_success; then
+      return 0
+    fi
+    recovery_boot_fallback "$version"
+    return 3
+  fi
+  if ! recovery_rebuild_dkms "$version" "$kernel"; then
+    recovery_show_dkms_failure "$version"
+    if [[ "$family" == modern ]] && recovery_modern_build_failure "$kernel"; then
+      return 0
+    fi
+    if [[ "$family" == legacy ]]; then
+      warn "This GPU's legacy driver branch has no supported newer branch to switch to; no driver packages were purged or upgraded."
+    fi
+    recovery_boot_fallback "$version"
+    return 3
+  fi
+  if recovery_finish_success; then
+    return 0
+  fi
+  recovery_boot_fallback "$version"
+  return 3
+}
+
 show_dkms_check_status() {
   local status
 
@@ -4796,6 +5594,13 @@ show_cuda_drivers_validation_status() {
 }
 
 show_check_context() {
+  local headers_meta
+  headers_meta="$(kernel_headers_meta_package)"
+  if package_installed "$headers_meta"; then
+    printf 'PASS: %s is installed for future kernel upgrades\n' "$headers_meta"
+  else
+    printf 'WARN: %s is not installed; future kernel upgrades may leave NVIDIA DKMS without build headers\n' "$headers_meta"
+  fi
   local dkms_status
   local lsmod_output
 
@@ -4843,7 +5648,9 @@ run_post_reboot_check() {
   MODINFO_ERR="$check_tmp/modinfo-nvidia.err"
 
   log "Running NVIDIA driver validation checks."
-
+  # nvidia-smi validation may trigger module loading by normal device access.
+  # Probe afterwards so a successfully loaded driver is not reported as merely
+  # unverified by the earlier read-only state.
   if check_result "nvidia-smi exists" command_exists nvidia-smi; then
     smi_exists_status=0
   else
@@ -4867,6 +5674,22 @@ run_post_reboot_check() {
   fi
   if dkms_has_nvidia_entries; then
     dkms_status=0
+  fi
+
+  probe_nvidia_kernel_state
+  printf 'Kernel convergence state: %s (%s)\n' "$KERNEL_PROBE_STATE" "$KERNEL_PROBE_HEADERS"
+  if [[ -n "$KERNEL_PROBE_DETAIL" ]] \
+    && [[ "$KERNEL_PROBE_STATE" == module-missing-for-running-kernel || "$KERNEL_PROBE_STATE" == module-present-load-unverified ]]; then
+    printf 'Kernel convergence detail: %s\n' "$KERNEL_PROBE_DETAIL"
+  fi
+  if [[ "$KERNEL_PROBE_STATE" == module-missing-for-running-kernel || "$KERNEL_PROBE_STATE" == module-present-load-unverified ]]; then
+    printf 'Remedy: sudo ./nvidia-cuda-installer.sh --repair-kernel\n'
+  elif [[ "$KERNEL_PROBE_STATE" == module-present-not-loadable ]]; then
+    recovery_diagnose_module_load "$KERNEL_PROBE_DETAIL"
+  fi
+  if [[ "$KERNEL_PROBE_STATE" != healthy ]]; then
+    printf 'FAIL: running-kernel NVIDIA driver has not been verified healthy (%s)\n' "$KERNEL_PROBE_STATE"
+    failures=$((failures + 1))
   fi
 
   show_cuda_drivers_validation_status "$smi_exists_status" "$smi_works_status" "$modinfo_status" "$modules_status" "$dkms_status" || failures=$((failures + 1))
@@ -4898,13 +5721,13 @@ run_post_reboot_check() {
 main() {
   validate_test_path_override_gate
   parse_args "$@"
+  require_root
   acquire_execution_lock
 
   if (( YOLO )); then
     warn "--yolo enabled: equivalent to --reset -y --allow-debian12-580-fallback --accept-cross-release-driver-packages --ignore-reset-blockers."
   fi
 
-  require_root
   parse_os_release
 
   if (( CHECK_ONLY )); then
@@ -4919,23 +5742,45 @@ main() {
 
   preflight_dpkg_state
 
+  if (( REPAIR_KERNEL )); then
+    if recover_nvidia_kernel; then
+      log "Repair-kernel completed."
+      exit 0
+    else
+      exit "$?"
+    fi
+  fi
+
   if has_installed_driver_packages || nonpackaged_nvidia_runtime_present; then
     if (( ! RESET )); then
+      local repaired=0
       show_detected_driver_packages
-      show_runtime_traces
+      probe_nvidia_kernel_state
+      log "Existing NVIDIA driver convergence state: $KERNEL_PROBE_STATE ($KERNEL_PROBE_HEADERS)."
+      if [[ "$KERNEL_PROBE_STATE" != healthy ]] || ! package_installed "$(kernel_headers_meta_package)"; then
+        log "Repairing the running-kernel NVIDIA module without purging driver packages."
+        if recover_nvidia_kernel; then
+          repaired=1
+        else
+          exit "$?"
+        fi
+      fi
       if [[ "$LAPTOP_POWER_MODE" != "off" || "$ENABLE_NVIDIA_SUSPEND_SERVICES" -eq 1 ]]; then
-        log "Existing NVIDIA driver state was detected. Skipping driver install/reset and evaluating only requested laptop power or suspend policy."
+        log "Existing NVIDIA driver is healthy; evaluating requested laptop power or suspend policy."
         if [[ "$LAPTOP_POWER_MODE" != "off" ]]; then
           maybe_configure_laptop_power_policy
         fi
         if (( ENABLE_NVIDIA_SUSPEND_SERVICES )); then
           configure_nvidia_suspend_services
         fi
-        log "Policy-only run complete. Validate after reboot with: sudo ./$SCRIPT_NAME --check"
+        log "Policy run complete. Validate with: sudo ./$SCRIPT_NAME --check"
         exit 0
       fi
-      log "Existing NVIDIA driver state was detected. No changes made."
-      log "Run again with --reset to purge existing driver state and install freshly."
+      if (( repaired )); then
+        log "Existing NVIDIA driver repaired for the running kernel; no driver packages were purged."
+      else
+        log "Existing NVIDIA driver state is healthy. No changes made."
+      fi
       exit 0
     fi
   fi

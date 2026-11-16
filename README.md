@@ -28,15 +28,17 @@ Core behavior:
   picks a driver branch policy: `auto`, `current`, `580`, or `470`
   (Maxwell/Pascal/Volta → 580; Turing and newer → current; Kepler refused
   unless `--allow-legacy-470`).
-- Convergent install: a completed install reruns as a no-op. `--reset` is the
-  explicit, repeatable purge-and-reinstall action; `--remove-only` purges and
-  exits.
+- Convergent install: reruns verify the module for the running kernel, repair
+  missing headers and DKMS state when necessary, and otherwise leave working
+  driver packages untouched. `--reset` is the explicit, repeatable
+  purge-and-reinstall action; `--remove-only` purges and exits.
 - Verifies NVIDIA repo trust via `cuda-keyring` before use; `apt-get update`
   remains the authoritative signature check.
 - Includes a managed, break-glass Debian 12 branch-580 vendor fallback for
   hosts whose GPUs need branch 580 when NVIDIA's Debian 13 repo lacks it
   (guarded by explicit acknowledgment flags).
-- `--check` runs post-reboot validation; `--dry-run` simulates without
+- `--check` runs post-reboot validation; `--repair-kernel` rebuilds an existing
+  driver for the running kernel without purging; `--dry-run` simulates without
   mutating; `-y` for unattended runs.
 
 Laptop idle-power policy (`--laptop-power=auto|ask|on|off`):
@@ -61,6 +63,57 @@ claimed or deleted. See
 for the detailed hardening history and rationale.
 
 Run `./nvidia-cuda-installer.sh --help` for the full option list.
+
+## My driver broke after a kernel upgrade
+
+If an APT kernel upgrade left `nvidia-smi` unable to communicate with the
+NVIDIA driver, check the running kernel and repair its DKMS module:
+
+```sh
+./nvidia-cuda-installer.sh --check
+sudo ./nvidia-cuda-installer.sh --repair-kernel --dry-run
+sudo ./nvidia-cuda-installer.sh --repair-kernel
+./nvidia-cuda-installer.sh --check
+```
+
+`--repair-kernel` installs the matching `linux-headers-$(uname -r)` package and
+the architecture's `linux-headers-amd64` or `linux-headers-arm64` tracking
+metapackage, reuses the installed NVIDIA DKMS source, and loads the base
+NVIDIA and required CUDA UVM modules. An ordinary `sudo ./nvidia-cuda-installer.sh`
+invocation also detects and repairs this missing-module state. It does not
+reset the NVIDIA driver or remove existing kernels. Driver upgrades are separately
+consented and require GPU compatibility validation. The tracking metapackage
+lets APT install matching headers with future kernel upgrades so the DKMS hook
+can build automatically.
+
+If the DKMS source cannot build for the new kernel, the script prints the
+last 40 lines of its build log. A fallback is offered only for an older
+installed kernel with matching on-disk NVIDIA and CUDA UVM modules, kernel
+image, initramfs, and exact generated GRUB entry. The modules' loadability on the
+older kernel cannot be guaranteed until boot. A boot selection or
+`apt-mark hold` requires `-y` or separate interactive confirmation. Failed
+recovery returns **exit code 3**; the currently running kernel remains
+unrepaired, even if a one-shot boot was scheduled. On supported newer GPUs,
+a modern driver can offer an explicitly consented `cuda-drivers` upgrade,
+followed by a DKMS-source reinstall only if the upgrade did not restore the
+module. Recovery checks GPU compatibility before offering this upgrade,
+including when an older driver release is installed. An unpinned R580
+installation on Turing can take this path; an explicit R580 pin and legacy GPU
+families cannot. Legacy GPUs are never switched to an incompatible branch.
+
+If Secure Boot rejects a rebuilt module, including a kernel-lockdown denial
+reported as `Operation not permitted`, the installer explains DKMS MOK signing
+and enrollment; it does not enroll keys. An unloaded module passes the
+convergence probe only after a real, successful module insertion during
+recovery. A read-only `--check` reports `module-present-load-unverified` when
+only a dry-run load probe was possible. `--check` also fails if the required
+`nvidia-uvm` module is missing, even when `nvidia-smi` succeeds. If UVM is
+present but has not been loaded, `--check` reports it as unverified and fails
+without inserting it. `--repair-kernel` attempts the actual UVM load; a
+successful module-file lookup alone cannot establish CUDA readiness. If the
+running module is stale after a package upgrade, recovery requests a reboot
+into the current kernel. See
+[docs/installer-kernel-recovery-v8-notes.md](docs/installer-kernel-recovery-v8-notes.md).
 
 ## fix-xorg-gdm-idle.sh
 
@@ -152,6 +205,7 @@ GPU returns to suspend shortly after the workload exits.
 Hermetic test suites for the installer live in `tests/`:
 
 ```sh
+./tests/test_kernel_upgrade_recovery.sh
 ./tests/test_laptop_power_helpers.sh
 ./tests/test_laptop_power_policy_behaviors.sh
 ./tests/test_laptop_power_drm_diagnostics.sh
@@ -175,6 +229,8 @@ and post-reboot driver validation, without touching real hardware state.
 
 ## Documentation
 
+- [docs/installer-kernel-recovery-v8-notes.md](docs/installer-kernel-recovery-v8-notes.md)
+  — kernel-upgrade recovery, convergence probing, lock relocation, and failure fallback.
 - [docs/installer-laptop-power-v7-notes.md](docs/installer-laptop-power-v7-notes.md)
   — detailed changelog and design rationale for the installer's laptop-power
   hardening revisions (lock/PATH/ownership discipline, branch-580 vendor

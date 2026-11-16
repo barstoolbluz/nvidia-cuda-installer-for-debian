@@ -14,7 +14,7 @@ Files:
 
 ## Hardening through v6
 
-- Adds a global `flock` execution lock. The lock defaults to `/run/lock/nvidia-cuda-installer.lock` when usable and falls back to `/tmp/nvidia-cuda-installer.lock`. The lock file itself may remain, but the kernel lock releases when the process exits, so a stale file does not block future runs.
+- In the historical v6/v7 implementation, adds a global `flock` execution lock under `/run/lock` or `/tmp`. **Correction (November 15, 2026):** in Debian 13, a stale file in either sticky world-writable directory can prevent subsequent root/non-root runs even after `flock` releases, because `fs.protected_regular=2` and file ownership prevent reopening it. The v8 code moves the root lock to `/run/nvidia-cuda-installer/lock` and makes `--check` / `--dry-run` unlocked and read-only. See [v8 recovery notes](installer-kernel-recovery-v8-notes.md).
 - Sanitizes production execution `PATH` to `/usr/sbin:/usr/bin:/sbin:/bin` near the top of the script.
 - Gates test-only managed path overrides behind `NVIDIA_CUDA_INSTALLER_TEST_MODE=1`. Production runs refuse polluted override environments instead of honoring `sudo -E` state accidentally.
 - Preflights laptop-power managed-file and ownership collisions before changing persistence mode, writing udev or modprobe files, changing systemd mask state, or touching sysfs.

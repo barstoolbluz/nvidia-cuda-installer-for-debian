@@ -188,7 +188,7 @@ fi
 
 # Global lock rejects a second concurrent installer instance and does not block after the first exits.
 reset_paths
-mkdir -p "$tmp/run"
+install -d -m 0755 "$tmp/run"
 (
   env NVIDIA_CUDA_INSTALLER_TEST_MODE=1 \
   NVIDIA_CUDA_INSTALLER_LOCK_FILE="$tmp/run/global.lock" \
