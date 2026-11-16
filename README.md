@@ -17,6 +17,84 @@ Both scripts are safe-by-default: they refuse ambiguous situations rather than
 guess, prove ownership before removing anything, and print explicit rollback
 paths.
 
+## Quick start
+
+Run these commands from the repository root on Debian 13 (Trixie):
+
+```sh
+# Preview the normal installation without changing system state
+sudo ./nvidia-cuda-installer.sh --dry-run
+
+# Install the NVIDIA driver stack or repair an existing installation
+sudo ./nvidia-cuda-installer.sh
+
+# Check driver health without changing system state
+./nvidia-cuda-installer.sh --check
+
+# Preview recovery after a kernel upgrade
+sudo ./nvidia-cuda-installer.sh --repair-kernel --dry-run
+
+# Repair the installed NVIDIA driver for the running kernel
+sudo ./nvidia-cuda-installer.sh --repair-kernel
+
+# Check hybrid-laptop idle power (read-only; includes a 60-second probe)
+./nvidia-cuda-installer.sh --check-laptop-power-idle
+
+# Show all options
+./nvidia-cuda-installer.sh --help
+```
+
+`--check` does not load kernel modules. It can report an unverified state when
+`nvidia-uvm` exists but has not yet been loaded; `--repair-kernel` attempts
+the real module load. The installer handles missing headers and DKMS recovery
+without requiring a purge. Driver upgrades and fallback-kernel actions have
+separate consent and compatibility checks. See
+[My driver broke after a kernel upgrade](#my-driver-broke-after-a-kernel-upgrade)
+for the recovery procedure and failure semantics.
+
+For laptop-specific configuration or the Xorg/GDM idle fix, follow
+[Typical workflow on a hybrid laptop](#typical-workflow-on-a-hybrid-laptop)
+and [fix-xorg-gdm-idle.sh](#fix-xorg-gdm-idlesh).
+
+## Developer tests
+
+These hermetic test suites exercise the installer with isolated fixtures and
+mocks. They do not change the host's APT, DKMS, GRUB, kernel-module, or
+service state. Run them from the repository root:
+
+```sh
+# Syntax-check each script (bash -n checks one script at a time)
+for script in nvidia-cuda-installer.sh fix-xorg-gdm-idle.sh tests/test_*.sh; do
+  bash -n "$script" || exit 1
+done
+
+# Run the five hermetic regression suites
+./tests/test_kernel_upgrade_recovery.sh
+./tests/test_laptop_power_helpers.sh
+./tests/test_laptop_power_policy_behaviors.sh
+./tests/test_laptop_power_drm_diagnostics.sh
+./tests/test_driver_validation.sh
+
+# Static analysis
+shellcheck nvidia-cuda-installer.sh
+```
+
+A Nix dev shell (`flake.nix`) provides ShellCheck, `flock`, and the GNU
+toolchain the suites expect, with umask 022:
+
+```sh
+nix develop
+```
+
+The suites cover kernel-upgrade recovery, driver validation, hybrid-laptop
+power policy, DRM/BDF mapping, ownership checks, and dry-run behavior. On a
+host running a live NVIDIA display stack, a few DRM-blocker and Runtime D3
+assertions in the laptop-power suites can fail from host-environment leakage;
+compare against a clean checkout before treating them as regressions.
+ShellCheck findings on the installer match the pre-recovery baseline. See
+[README-HANDOFF.md](README-HANDOFF.md) for the delivery's verification record.
+
+
 ## nvidia-cuda-installer.sh
 
 Installs NVIDIA proprietary CUDA driver packages from the NVIDIA APT
@@ -199,22 +277,6 @@ Expected end state with GDM running: `runtime_status=suspended` and
 `runtime_usage=0` for the NVIDIA PCI function while idle, `prime-run
 nvidia-smi` (or any CUDA/offload workload) wakes the GPU on demand, and the
 GPU returns to suspend shortly after the workload exits.
-
-## Tests
-
-Hermetic test suites for the installer live in `tests/`:
-
-```sh
-./tests/test_kernel_upgrade_recovery.sh
-./tests/test_laptop_power_helpers.sh
-./tests/test_laptop_power_policy_behaviors.sh
-./tests/test_laptop_power_drm_diagnostics.sh
-./tests/test_driver_validation.sh
-```
-
-They cover laptop/hybrid detection, Runtime D3 decisions, DRM/BDF mapping and
-blocker classification, ownership/sentinel handling, dry-run non-mutation,
-and post-reboot driver validation, without touching real hardware state.
 
 ## Requirements
 
